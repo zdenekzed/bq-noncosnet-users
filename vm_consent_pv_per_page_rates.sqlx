@@ -1,0 +1,108 @@
+config {
+  type: "incremental",
+  uniqueKey: ["event_day", "project_id", "channel_group_1", "channel_group_2"],
+  bigquery: {
+    partitionBy: "event_day",
+    clusterBy: ["project_id", "channel_group_1", "channel_group_2"]
+  },
+  schema: "dm_traffic_source_derivated",
+  database: "livesport-cz-analytics",
+  description: "7D rolling metriky per user pro consentované uživatele podle project_id a channel_grouping.",
+  tags: ["select", "michal"]
+}
+
+pre_operations {
+  declare date_checkpoint default ( select format_date("%Y-%m-%d",
+    ${when(incremental(),
+    `(select max(event_day) from ${self()}
+      )`,
+    `"2025-10-01"`
+    )}
+    )
+  )
+;
+}
+with date_ranges as (
+  select 
+    event_day,
+    date_sub(event_day, interval 8 day) as date_from,
+    date_sub(event_day, interval 1 day) as date_to
+
+  from `livesport-cz-analytics.tools_c.c_date` 
+  where event_day >= CAST(date_checkpoint AS DATE)
+  and event_day < CURRENT_DATE()
+)
+,consent_metrics as (
+  select
+    d.event_day,
+    d.date_from,
+    d.date_to,
+    t.project_id,
+    
+    ${channel_group_mkt.channelGroupingLvl1("ga_source", "ga_medium","ga_campaign", "campaign_advertising_channel_type")} as channel_group_1,
+    ${channel_group_mkt.channelGroupingLvl2("ga_source", "ga_medium","ga_campaign", "campaign_advertising_channel_type")} as channel_group_2,
+    
+    --Zakladni metriky
+    count(distinct t.user_code_mix) as consented_users,
+    sum(t.entrances) as consented_entrances,
+    safe_divide(sum(t.entrances), count(distinct t.user_code_mix)) as raw_entrances_per_user,
+    sum(t.page_views) as consented_page_views,
+    safe_divide(sum(t.page_views), count(distinct t.user_code_mix)) as raw_pv_per_user,
+    sum(t.odds_all) as consented_odds_all,
+    safe_divide(sum(t.odds_all), count(distinct t.user_code_mix)) as raw_odds_all_per_user,
+    sum(t.odds_first) as consented_odds_first,
+    safe_divide(sum(t.odds_first), count(distinct t.user_code_mix)) as raw_odds_first_per_user
+
+
+  from ${ref("fact_web_traffic_user_daily")} t
+  join date_ranges d 
+    on t.event_day between d.date_from and d.date_to
+  where t.user_group_id <> '1'  -- pouze consent
+    and t.event_day >= date_sub(CAST(date_checkpoint AS DATE), interval 8 day)
+  group by all
+)
+,project_fallbacks as (
+  select 
+    event_day,
+    project_id,
+    avg(raw_entrances_per_user) as project_avg_entraces_per_user,
+    avg(raw_pv_per_user) as project_avg_pv_per_user,
+    avg(raw_odds_all_per_user) as project_avg_odds_all_per_user,
+    avg(raw_odds_first_per_user) as project_avg_odds_first_per_user,
+  from consent_metrics
+  group by 1, 2
+)
+
+-- Global fallback pro extrémní případy
+,global_fallbacks as (
+  select 
+    event_day,
+    avg(raw_entrances_per_user) as global_avg_entraces_per_user,
+    avg(raw_pv_per_user) as global_avg_pv_per_user,
+    avg(raw_odds_all_per_user) as global_avg_odds_all_per_user,
+    avg(raw_odds_first_per_user) as global_avg_odds_first_per_user,
+  from consent_metrics
+  group by 1
+)
+
+select
+  a.event_day,
+  --a.date_from,
+  --a.date_to,
+  a.project_id,
+  a.channel_group_1,
+  a.channel_group_2,
+
+  -- Základní metriky
+  --a.consented_users,
+  --a.consented_entrances,
+  COALESCE(a.raw_entrances_per_user, project_avg_entraces_per_user, global_avg_entraces_per_user) AS consented_entrances_per_user,
+  --a.consented_page_views,
+  COALESCE(a.raw_pv_per_user, project_avg_pv_per_user, global_avg_pv_per_user) AS consented_pv_per_user,
+  --a.consented_odds_all,
+  COALESCE(a.raw_odds_all_per_user, project_avg_odds_all_per_user, global_avg_odds_all_per_user) AS consented_odds_all_per_user,
+  --a.consented_odds_first
+  COALESCE(a.raw_odds_first_per_user, project_avg_odds_first_per_user, global_avg_odds_first_per_user) AS consented_odds_first_per_user
+from consent_metrics a
+left join project_fallbacks pf using (event_day, project_id)
+left join global_fallbacks gf using (event_day)
